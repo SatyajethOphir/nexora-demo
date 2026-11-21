@@ -1,0 +1,6 @@
+{
+  "name": "NEXORA Shopping",
+  "description": "Discover. Shop. Experience. A modern installable e-commerce shopping web application with curated tech, fashion, home, and lifestyle essentials.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
