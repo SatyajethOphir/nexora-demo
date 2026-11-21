@@ -1,5 +1,6 @@
-// Custom Service Worker for NEXORA PWA & Web Push Notifications
+// Custom Service Worker for NEXORA PWA & Production Web Push Notifications
 // Compiled by vite-plugin-pwa (injectManifest strategy)
+import { API_BASE_URL, apiUrl } from './config/api';
 
 interface SWPrecacheEntry {
   url: string;
@@ -31,11 +32,17 @@ interface SWPushEvent extends SWExtendableEvent {
   } | null;
 }
 
+interface SWPushSubscriptionChangeEvent extends SWExtendableEvent {
+  oldSubscription?: PushSubscription | null;
+  newSubscription?: PushSubscription | null;
+}
+
 interface SWNotification {
   title: string;
   data?: {
     url?: string;
     scenario?: string;
+    sentAt?: string;
   };
   close(): void;
 }
@@ -58,6 +65,16 @@ interface SWMessageEvent extends SWExtendableEvent {
   } | null;
 }
 
+interface SWNotificationAction {
+  action: string;
+  title: string;
+}
+
+interface SWNotificationOptions extends NotificationOptions {
+  renotify?: boolean;
+  actions?: SWNotificationAction[];
+}
+
 interface SWGlobalScope {
   __WB_MANIFEST: Array<SWPrecacheEntry | string>;
   location: Location;
@@ -68,12 +85,17 @@ interface SWGlobalScope {
     openWindow(url: string): Promise<SWWindowClient | null>;
   };
   registration: {
-    showNotification(title: string, options?: NotificationOptions): Promise<void>;
+    pushManager: PushManager;
+    showNotification(title: string, options?: SWNotificationOptions): Promise<void>;
   };
   addEventListener(type: 'install', listener: (event: SWExtendableEvent) => void): void;
   addEventListener(type: 'activate', listener: (event: SWExtendableEvent) => void): void;
   addEventListener(type: 'fetch', listener: (event: SWFetchEvent) => void): void;
   addEventListener(type: 'push', listener: (event: SWPushEvent) => void): void;
+  addEventListener(
+    type: 'pushsubscriptionchange',
+    listener: (event: SWPushSubscriptionChangeEvent) => void
+  ): void;
   addEventListener(type: 'notificationclick', listener: (event: SWNotificationEvent) => void): void;
   addEventListener(type: 'message', listener: (event: SWMessageEvent) => void): void;
 }
@@ -87,6 +109,24 @@ const PRECACHE_URLS = PRECACHE_MANIFEST.map((entry) =>
 );
 
 const SENSITIVE_PATH_PREFIXES = ['/api/', '/checkout', '/payment', '/profile', '/orders'];
+
+function sanitizeRelativeTarget(rawUrl?: string): string {
+  if (!rawUrl || typeof rawUrl !== 'string') return '/';
+  const trimmed = rawUrl.trim();
+  if (!trimmed.startsWith('/') || trimmed.startsWith('//')) return '/';
+  return trimmed;
+}
+
+function swUrlBase64ToUint8Array(base64String: string): Uint8Array {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; ++i) {
+    outputArray[i] = rawData.charCodeAt(i);
+  }
+  return outputArray;
+}
 
 sw.addEventListener('install', (event) => {
   event.waitUntil(
@@ -119,8 +159,11 @@ sw.addEventListener('fetch', (event) => {
   if (request.method !== 'GET') return;
 
   const url = new URL(request.url);
+  if (API_BASE_URL && url.href.startsWith(API_BASE_URL)) {
+    return;
+  }
+
   if (url.origin !== sw.location.origin) {
-    // Allow Google Fonts caching if applicable
     if (
       url.hostname === 'fonts.googleapis.com' ||
       url.hostname === 'fonts.gstatic.com'
@@ -140,7 +183,7 @@ sw.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Never serve stale cached responses for checkout, payment, profile, or orders navigation
+  // Never serve stale cached responses for API, checkout, payment, profile, or orders
   const isSensitive = SENSITIVE_PATH_PREFIXES.some((prefix) =>
     url.pathname.startsWith(prefix)
   );
@@ -178,7 +221,7 @@ sw.addEventListener('fetch', (event) => {
   );
 });
 
-// Real Web Push Event Handler (for server-triggered VAPID push messages)
+// Real Web Push Event Handler (runs even when NEXORA or Android TWA is minimized or closed)
 sw.addEventListener('push', (event) => {
   let payload: {
     title?: string;
@@ -186,6 +229,7 @@ sw.addEventListener('push', (event) => {
     url?: string;
     tag?: string;
     scenario?: string;
+    sentAt?: string;
   } = {};
 
   if (event.data) {
@@ -198,7 +242,7 @@ sw.addEventListener('push', (event) => {
 
   const title = payload.title || 'NEXORA Update';
   const body = payload.body || 'Discover something new today on NEXORA.';
-  const targetUrl = payload.url || '/';
+  const targetUrl = sanitizeRelativeTarget(payload.url);
 
   event.waitUntil(
     sw.registration.showNotification(title, {
@@ -206,18 +250,65 @@ sw.addEventListener('push', (event) => {
       icon: '/pwa-192x192.png',
       badge: '/pwa-192x192.png',
       tag: payload.tag || `nexora-push-${Date.now()}`,
+      renotify: true,
+      actions: [{ action: 'open', title: 'Open NEXORA' }],
       data: {
         url: targetUrl,
-        scenario: payload.scenario || 'push',
+        scenario: payload.scenario || 'web-push',
+        sentAt: payload.sentAt || new Date().toISOString(),
       },
     })
   );
 });
 
-// Notification Click Handler — opens or focuses NEXORA and navigates cleanly
+// Handle browser / FCM push subscription key rotation automatically in the background
+sw.addEventListener('pushsubscriptionchange', (event) => {
+  event.waitUntil(
+    (async () => {
+      try {
+        let subscription = event.newSubscription || null;
+
+        if (!subscription) {
+          let applicationServerKey: BufferSource | undefined =
+            event.oldSubscription?.options?.applicationServerKey || undefined;
+
+          if (!applicationServerKey) {
+            const res = await fetch(apiUrl('/api/push/vapid-public-key'));
+            if (res.ok) {
+              const data = (await res.json()) as { publicKey?: string };
+              if (data.publicKey) {
+                const keyBytes = swUrlBase64ToUint8Array(data.publicKey);
+                applicationServerKey = keyBytes.buffer as ArrayBuffer;
+              }
+            }
+          }
+
+          if (!applicationServerKey) return;
+
+          subscription = await sw.registration.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey,
+          });
+        }
+
+        await fetch(apiUrl('/api/push/subscribe'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ subscription: subscription.toJSON() }),
+        });
+      } catch {
+        // Silent best-effort sync; foreground client also heals stale subscriptions on next visit
+      }
+    })()
+  );
+});
+
+// Notification Click Handler — focuses running PWA/TWA or cold-starts target route
 sw.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const targetPath = event.notification.data?.url || '/';
+  if (event.action === 'dismiss') return;
+
+  const targetPath = sanitizeRelativeTarget(event.notification.data?.url);
   const absoluteTarget = new URL(targetPath, sw.location.origin).href;
 
   event.waitUntil(
@@ -256,8 +347,10 @@ sw.addEventListener('message', (event) => {
         icon: '/pwa-192x192.png',
         badge: '/pwa-192x192.png',
         tag: tag || `nexora-local-${Date.now()}`,
+        renotify: true,
+        actions: [{ action: 'open', title: 'Open NEXORA' }],
         data: {
-          url: url || '/',
+          url: sanitizeRelativeTarget(url),
           scenario: scenario || 'local',
         },
       })

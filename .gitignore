@@ -1,8 +1,40 @@
+# Dependencies
 node_modules/
+
+# Build output
 build/
 dist/
 coverage/
-.DS_Store
-*.log
+
+# Environment variables and secrets
 .env*
 !.env.example
+
+# Local data
+data/
+
+# Logs
+*.log
+
+# Operating system
+.DS_Store
+Thumbs.db
+
+# Cloudflare local state
+.wrangler/
+
+# Editor
+.vscode/
+
+# Android signing credentials
+*.keystore
+*.jks
+
+# Android generated release files
+*.apk
+*.aab
+*.idsig
+
+# Gradle cache and generated builds
+.gradle/
+app/build/

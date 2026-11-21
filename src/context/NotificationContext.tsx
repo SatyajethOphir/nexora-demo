@@ -15,12 +15,15 @@ import {
 import {
   BrowserPermissionState,
   dispatchLocalNotification,
+  ensureServerPushSubscription,
   getBrowserPermission,
   getWebPushStatus,
+  NotificationDispatchPayload,
   NotificationDispatchResult,
   requestBrowserNotificationPermission,
-  subscribeToRealWebPush,
-  unsubscribeFromRealWebPush,
+  sendServerBackgroundTestPush,
+  sendServerOrderEventPush,
+  unsubscribeAndRemoveFromServer,
   WebPushSubscriptionState,
 } from '../services/pushNotificationService';
 import { readStorage, STORAGE_KEYS, writeStorage } from '../utils/storage';
@@ -30,9 +33,9 @@ export interface NotificationHistoryEntry {
   id: string;
   title: string;
   body: string;
-  scenario: NotificationScenarioId | 'test';
+  scenario: NotificationScenarioId | 'test' | 'background-test';
   url: string;
-  deliveredVia: 'service-worker' | 'notification-api' | 'in-app-only';
+  deliveredVia: 'service-worker' | 'notification-api' | 'web-push' | 'in-app-only';
   timestamp: string;
   note?: string;
 }
@@ -48,15 +51,27 @@ interface NotificationContextValue {
   history: NotificationHistoryEntry[];
   webPushStatus: WebPushSubscriptionState;
   swRegistered: boolean;
+  subscribingPush: boolean;
+  sendingServerPush: boolean;
   enableNotifications: () => Promise<void>;
   disableNotifications: () => void;
   startTesting: () => Promise<void>;
   stopTesting: () => void;
   sendTestNotification: () => Promise<void>;
   triggerScenario: (scenario: NotificationScenario) => Promise<void>;
-  notifyOrderEvent: (title: string, body: string, url: string, scenario: NotificationScenarioId) => Promise<void>;
+  triggerServerScenario: (scenario: NotificationScenario, delaySeconds?: number) => Promise<void>;
+  notifyOrderEvent: (
+    title: string,
+    body: string,
+    url: string,
+    scenario: NotificationScenarioId
+  ) => Promise<void>;
   clearHistory: () => void;
-  testWebPushSubscription: () => Promise<{ ok: boolean; message: string }>;
+  syncBackgroundPush: () => Promise<{ ok: boolean; message: string }>;
+  sendBackgroundPushTest: (
+    delaySeconds?: number,
+    customPayload?: NotificationDispatchPayload
+  ) => Promise<{ ok: boolean; scheduled?: boolean; message: string }>;
 }
 
 const NotificationContext = createContext<NotificationContextValue | null>(null);
@@ -81,11 +96,17 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({
   const [nextScheduledAt, setNextScheduledAt] = useState<number | null>(null);
   const [sentCountInSession, setSentCountInSession] = useState(0);
   const [swRegistered, setSwRegistered] = useState(false);
+  const [subscribingPush, setSubscribingPush] = useState(false);
+  const [sendingServerPush, setSendingServerPush] = useState(false);
+
   const [webPushStatus, setWebPushStatus] = useState<WebPushSubscriptionState>({
     supported: false,
     subscribed: false,
     endpoint: null,
     vapidConfigured: false,
+    ephemeralVapid: false,
+    serverSynced: false,
+    activePublicKey: null,
   });
 
   const intervalRef = useRef<number | null>(null);
@@ -99,33 +120,53 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({
     writeStorage(STORAGE_KEYS.NOTIF_HISTORY, history.slice(0, 50));
   }, [history]);
 
-  // Sync browser permission & Service Worker registration status cleanly
+  // Sync browser permission, Service Worker registration, and server VAPID PushManager state
   const refreshStatus = useCallback(async () => {
-    setPermission(getBrowserPermission());
+    const currentPerm = getBrowserPermission();
+    setPermission(currentPerm);
+
     if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
       try {
         const reg = await navigator.serviceWorker.getRegistration();
-        setSwRegistered(!!reg);
+        setSwRegistered(Boolean(reg));
       } catch {
         setSwRegistered(false);
       }
     }
+
     const pushState = await getWebPushStatus();
     setWebPushStatus(pushState);
+    return pushState;
   }, []);
 
+  // Auto-sync PushSubscription on mount/focus if permission is already granted & app alerts are enabled
   useEffect(() => {
-    refreshStatus();
+    let active = true;
+
+    const syncOnReady = async () => {
+      const pushState = await refreshStatus();
+      if (!active) return;
+      if (appEnabled && getBrowserPermission() === 'granted' && pushState.supported && !pushState.serverSynced) {
+        const res = await ensureServerPushSubscription();
+        if (active && res.ok) {
+          await refreshStatus();
+        }
+      }
+    };
+
+    void syncOnReady();
+
     const handleVisibilityOrFocus = () => {
-      refreshStatus();
+      void refreshStatus();
     };
     window.addEventListener('focus', handleVisibilityOrFocus);
     document.addEventListener('visibilitychange', handleVisibilityOrFocus);
     return () => {
+      active = false;
       window.removeEventListener('focus', handleVisibilityOrFocus);
       document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
     };
-  }, [refreshStatus]);
+  }, [appEnabled, refreshStatus]);
 
   const recordHistory = useCallback((entry: NotificationHistoryEntry) => {
     setHistory((prev) => [entry, ...prev].slice(0, 50));
@@ -200,6 +241,18 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({
     setSecondsRemaining(DEFAULT_TEST_INTERVAL_SECONDS);
   }, [clearTimer]);
 
+  const syncBackgroundPush = useCallback(async () => {
+    setSubscribingPush(true);
+    try {
+      const res = await ensureServerPushSubscription();
+      await refreshStatus();
+      showToast(res.message, res.ok ? 'success' : 'info');
+      return { ok: res.ok, message: res.message };
+    } finally {
+      setSubscribingPush(false);
+    }
+  }, [refreshStatus, showToast]);
+
   const enableNotifications = useCallback(async () => {
     setAppEnabled(true);
     const current = getBrowserPermission();
@@ -211,7 +264,14 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({
 
     if (current === 'granted') {
       setPermission('granted');
-      showToast('NEXORA notifications are enabled.', 'success');
+      const subRes = await ensureServerPushSubscription();
+      await refreshStatus();
+      showToast(
+        subRes.ok
+          ? 'Notifications & Background Web Push enabled.'
+          : 'NEXORA browser notifications are enabled.',
+        'success'
+      );
       return;
     }
 
@@ -226,13 +286,21 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({
 
     const nextPerm = await requestBrowserNotificationPermission();
     setPermission(nextPerm);
-    await refreshStatus();
 
     if (nextPerm === 'granted') {
-      showToast('Notification permission granted.', 'success');
+      const subRes = await ensureServerPushSubscription();
+      await refreshStatus();
+      showToast(
+        subRes.ok
+          ? 'Permission granted & device subscribed for Background Web Push.'
+          : 'Notification permission granted.',
+        'success'
+      );
     } else if (nextPerm === 'denied') {
+      await refreshStatus();
       showToast('Notification permission denied by browser.', 'error');
     } else {
+      await refreshStatus();
       showToast('Notification prompt dismissed.', 'info');
     }
   }, [refreshStatus, showToast]);
@@ -240,8 +308,8 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({
   const disableNotifications = useCallback(() => {
     stopTesting();
     setAppEnabled(false);
-    unsubscribeFromRealWebPush().then(refreshStatus).catch(() => {});
-    showToast('NEXORA notifications disabled and active test timers stopped.', 'info');
+    void unsubscribeAndRemoveFromServer().then(refreshStatus).catch(() => {});
+    showToast('NEXORA notifications disabled and server push subscription removed.', 'info');
   }, [refreshStatus, showToast, stopTesting]);
 
   const fireAutoTestNotification = useCallback(async () => {
@@ -263,7 +331,6 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({
   }, [deliverAndRecord, showToast]);
 
   const startTesting = useCallback(async () => {
-    // Prevent duplicate intervals
     clearTimer();
 
     if (!appEnabled) {
@@ -281,7 +348,7 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({
         'info'
       );
     } else {
-      showToast('1-minute notification testing mode started.', 'success');
+      showToast('1-minute foreground notification testing mode started.', 'success');
     }
 
     const now = Date.now();
@@ -291,7 +358,7 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({
     setIsTestingActive(true);
   }, [appEnabled, clearTimer, showToast]);
 
-  // Single authoritative interval when testing mode is active
+  // Single authoritative interval when foreground testing mode is active
   useEffect(() => {
     if (!isTestingActive) {
       clearTimer();
@@ -324,7 +391,7 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({
   const sendTestNotification = useCallback(async () => {
     const res = await deliverAndRecord({
       title: 'NEXORA Notification Test',
-      body: 'This is your immediate test notification. Click to open the NEXORA storefront.',
+      body: 'This is your immediate Service Worker test notification. Click to open NEXORA.',
       url: '/',
       scenario: 'test',
     });
@@ -337,9 +404,86 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({
         'success'
       );
     } else {
-      showToast(res.reason || 'Logged in notification history (browser permission required for OS banner).', 'info');
+      showToast(res.reason || 'Logged in notification history (permission required for OS banner).', 'info');
     }
   }, [deliverAndRecord, showToast]);
+
+  const sendBackgroundPushTest = useCallback(
+    async (delaySeconds = 0, customPayload?: NotificationDispatchPayload) => {
+      setSendingServerPush(true);
+      try {
+        if (getBrowserPermission() !== 'granted') {
+          const msg = 'Grant browser notification permission first.';
+          showToast(msg, 'error');
+          return { ok: false, message: msg };
+        }
+
+        // Ensure server has up-to-date subscription before dispatching
+        let endpoint = webPushStatus.endpoint;
+        if (!endpoint || !webPushStatus.serverSynced) {
+          const syncRes = await ensureServerPushSubscription();
+          const refreshed = await refreshStatus();
+          endpoint = syncRes.subscription?.endpoint || refreshed.endpoint;
+          if (!syncRes.ok || !endpoint) {
+            showToast(syncRes.message, 'error');
+            return { ok: false, message: syncRes.message };
+          }
+        }
+
+        const payload = {
+          title: customPayload?.title || 'NEXORA Background Web Push',
+          body:
+            customPayload?.body ||
+            (delaySeconds > 0
+              ? `Delivered by NEXORA server after ${delaySeconds}s — even while closed or minimized.`
+              : 'Genuine VAPID Web Push delivered directly from the NEXORA backend.'),
+          url: customPayload?.url || '/notifications',
+          tag: customPayload?.tag || `nexora-push-${Date.now()}`,
+          scenario: customPayload?.scenario || 'background-test',
+        };
+
+        let result = await sendServerBackgroundTestPush({
+          endpoint,
+          notification: payload,
+          delaySeconds,
+        });
+
+        // Auto-recover once if endpoint expired/unregistered on server restart
+        if (!result.ok && (result.expired || result.message.includes('not registered'))) {
+          const reSync = await ensureServerPushSubscription();
+          const refreshed = await refreshStatus();
+          if (reSync.ok && refreshed.endpoint) {
+            result = await sendServerBackgroundTestPush({
+              endpoint: refreshed.endpoint,
+              notification: payload,
+              delaySeconds,
+            });
+          }
+        }
+
+        recordHistory({
+          id: `ntf-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          title: payload.title,
+          body: payload.body,
+          scenario: (payload.scenario as NotificationScenarioId | 'background-test') || 'background-test',
+          url: payload.url,
+          deliveredVia: result.ok ? 'web-push' : 'in-app-only',
+          timestamp: new Date().toISOString(),
+          note: result.ok
+            ? delaySeconds > 0
+              ? `Server scheduled Web Push in ${delaySeconds}s`
+              : 'Sent via VAPID Web Push server'
+            : result.message,
+        });
+
+        showToast(result.message, result.ok ? 'success' : 'error');
+        return result;
+      } finally {
+        setSendingServerPush(false);
+      }
+    },
+    [recordHistory, refreshStatus, showToast, webPushStatus.endpoint, webPushStatus.serverSynced]
+  );
 
   const triggerScenario = useCallback(
     async (scenario: NotificationScenario) => {
@@ -351,7 +495,7 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({
       });
 
       if (res.ok) {
-        showToast(`Sent "${scenario.label}" notification.`, 'success');
+        showToast(`Sent "${scenario.label}" via Service Worker.`, 'success');
       } else {
         showToast(`Logged "${scenario.label}" in history (${res.reason}).`, 'info');
       }
@@ -359,25 +503,50 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({
     [deliverAndRecord, showToast]
   );
 
+  const triggerServerScenario = useCallback(
+    async (scenario: NotificationScenario, delaySeconds = 0) => {
+      await sendBackgroundPushTest(delaySeconds, {
+        title: scenario.title,
+        body: scenario.body,
+        url: scenario.url,
+        scenario: scenario.id,
+      });
+    },
+    [sendBackgroundPushTest]
+  );
+
   const notifyOrderEvent = useCallback(
     async (title: string, body: string, url: string, scenario: NotificationScenarioId) => {
       if (!appEnabled || getBrowserPermission() !== 'granted') return;
+
+      if (webPushStatus.subscribed && webPushStatus.endpoint) {
+        const pushRes = await sendServerOrderEventPush({
+          endpoint: webPushStatus.endpoint,
+          notification: { title, body, url, scenario },
+        });
+        if (pushRes.ok) {
+          recordHistory({
+            id: `ntf-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            title,
+            body,
+            scenario,
+            url,
+            deliveredVia: 'web-push',
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+      }
+
       await deliverAndRecord({ title, body, url, scenario });
     },
-    [appEnabled, deliverAndRecord]
+    [appEnabled, deliverAndRecord, recordHistory, webPushStatus.endpoint, webPushStatus.subscribed]
   );
 
   const clearHistory = useCallback(() => {
     setHistory([]);
     showToast('Notification history cleared.', 'info');
   }, [showToast]);
-
-  const testWebPushSubscription = useCallback(async () => {
-    const res = await subscribeToRealWebPush();
-    await refreshStatus();
-    showToast(res.message, res.ok ? 'success' : 'info');
-    return { ok: res.ok, message: res.message };
-  }, [refreshStatus, showToast]);
 
   return (
     <NotificationContext.Provider
@@ -392,15 +561,19 @@ export const NotificationProvider: React.FC<{ children: React.ReactNode }> = ({
         history,
         webPushStatus,
         swRegistered,
+        subscribingPush,
+        sendingServerPush,
         enableNotifications,
         disableNotifications,
         startTesting,
         stopTesting,
         sendTestNotification,
         triggerScenario,
+        triggerServerScenario,
         notifyOrderEvent,
         clearHistory,
-        testWebPushSubscription,
+        syncBackgroundPush,
+        sendBackgroundPushTest,
       }}
     >
       {children}

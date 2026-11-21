@@ -17,6 +17,7 @@ export const Profile: React.FC = () => {
     permission,
     appEnabled,
     isTestingActive,
+    webPushStatus,
     enableNotifications,
     disableNotifications,
     sendTestNotification,
@@ -121,7 +122,12 @@ export const Profile: React.FC = () => {
               </h2>
               <p className="text-xs sm:text-sm text-slate-600 mt-0.5">
                 Status: <strong className="capitalize text-slate-900">{permission}</strong> ·{' '}
-                {permissionSummary}
+                {permissionSummary} ·{' '}
+                <strong className="text-slate-900">
+                  {webPushStatus.subscribed && webPushStatus.serverSynced
+                    ? 'Background Server Push Subscribed'
+                    : 'Background Push Not Subscribed'}
+                </strong>
                 {isTestingActive ? ' · 1-minute testing active.' : ''}
               </p>
             </div>
