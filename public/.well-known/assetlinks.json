@@ -1,0 +1,15 @@
+
+[
+  {
+    "relation": [
+      "delegate_permission/common.handle_all_urls"
+    ],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.sopdev.nexora",
+      "sha256_cert_fingerprints": [
+        "7F:95:91:EF:69:19:D2:CB:72:B5:39:96:72:2F:93:6E:79:32:77:BA:B0:13:34:F5:01:AB:1A:D7:6F:B8:6E:E1"
+      ]
+    }
+  }
+]
